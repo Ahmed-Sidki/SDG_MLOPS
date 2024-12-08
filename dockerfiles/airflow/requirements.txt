@@ -1,0 +1,9 @@
+mlflow
+dvc
+xgboost
+imblearn
+feature-engine
+loguru
+cryptography==3.4.7
+pyOpenSSL==19.0.0
+nltk==3.5
