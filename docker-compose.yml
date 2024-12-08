@@ -1,0 +1,223 @@
+version: '3.7'
+
+x-airflow-common:
+  &airflow-common
+  build: ./dockerfiles/airflow
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER_AIRFLOW}:${POSTGRES_PASSWORD_AIRFLOW}@postgres-airflow/${POSTGRES_DB_AIRFLOW}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER_AIRFLOW}:${POSTGRES_PASSWORD_AIRFLOW}@postgres-airflow/${POSTGRES_DB_AIRFLOW}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKEND: 'airflow.api.auth.backend.basic_auth'
+    # _PIP_ADDITIONAL_REQUIREMENTS: 'mlflow'
+    MLFLOW_TRACKING_URI: "http://mlflow-webserver:5000"
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
+    - ./notebooks:/opt/airflow/notebooks
+    - ./src:/opt/airflow/src
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+
+    # This container runs the postgresql database for mlflow.
+    postgres-mlflow:
+        image: postgres:13
+        environment:
+          POSTGRES_USER: ${POSTGRES_USER_MLFLOW}
+          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD_MLFLOW}
+          POSTGRES_DB: ${POSTGRES_DB_MLFLOW}
+        volumes:
+          # The data folder is a named volume mounted to /var/lib/postgresql/data
+          - postgres-db-volume-mlflow:/var/lib/postgresql/data
+
+
+    # minio : this container runs minio that can help us deal with aws s3 locally 
+    minio:
+      image: minio/minio:latest
+      ports:
+        - '9000:9000'
+        - '9090:9090'
+      volumes:
+        - './minio_data:/data'
+      environment:
+        MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+        MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      command: server --console-address ":9090" /data
+
+    # This container runs the webserver for mlflow.
+    mlflow-webserver:
+        build: ./dockerfiles/mlflow
+        image: mlflow_server
+        ports:
+          - "5000:5000"
+        environment:
+          # The following credentials allow connection to the S3 server.
+           AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+           AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+           MLFLOW_TRACKING_URI: "http://mlflow-webserver:5000"
+           MLFLOW_S3_ENDPOINT_URL: "http://minio:9000"
+
+        # The following command will launch the mlflow webserver on port 5000, with postgresql as the database
+        # and S3 as the artifact storage.
+        # The option "--serve-artifacts" will enable the serving of artifacts through mlflow as a proxy to the S3 server.
+        command: mlflow server --backend-store-uri postgresql://${POSTGRES_USER_MLFLOW}:${POSTGRES_PASSWORD_MLFLOW}@postgres-mlflow/${POSTGRES_DB_MLFLOW} --host 0.0.0.0 --serve-artifacts --artifacts-destination s3://${MLFLOW_BUCKET_NAME}
+        depends_on:
+          - postgres-mlflow
+          - minio
+
+    # This container runs the postgresql database for airflow.
+    postgres-airflow:
+      image: postgres:13
+      environment:
+        POSTGRES_USER: ${POSTGRES_USER_AIRFLOW}
+        POSTGRES_PASSWORD: ${POSTGRES_PASSWORD_AIRFLOW}
+        POSTGRES_DB: ${POSTGRES_DB_AIRFLOW}
+      volumes:
+        - postgres-db-volume-airflow:/var/lib/postgresql/data
+      healthcheck:
+        test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER_AIRFLOW}"]
+        interval: 5s
+        retries: 5
+      restart: always
+
+    pgadmin:
+      image: dpage/pgadmin4
+      environment:
+        PGADMIN_DEFAULT_EMAIL: "admin@example.com"
+        PGADMIN_DEFAULT_PASSWORD: "admin"
+      ports:
+        - "5050:80"
+      depends_on:
+        - postgres-airflow
+    
+    # The redis - broker that forwards messages from scheduler to worker.
+    redis:
+      image: redis:latest
+      expose:
+        - 6379
+      healthcheck:
+        test: ["CMD", "redis-cli", "ping"]
+        interval: 5s
+        timeout: 30s
+        retries: 50
+      restart: always
+
+
+    airflow-webserver:
+      <<: *airflow-common
+      command: webserver
+      ports:
+        - "8080:8080"
+      healthcheck:
+        test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+        interval: 10s
+        timeout: 10s
+        retries: 5
+      restart: always
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+
+    airflow-scheduler:
+      <<: *airflow-common
+      command: scheduler
+      healthcheck:
+        test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+        interval: 10s
+        timeout: 10s
+        retries: 5
+      restart: always
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+    # The worker that executes the tasks given by the scheduler.
+    airflow-worker:
+      <<: *airflow-common
+      command: celery worker
+      healthcheck:
+        test:
+          - "CMD-SHELL"
+          - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+        interval: 10s
+        timeout: 10s
+        retries: 5
+      environment:
+        <<: *airflow-common-env
+        # Required to handle warm shutdown of the celery workers properly
+        # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
+        DUMB_INIT_SETSID: "0"
+      restart: always
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+
+    airflow-triggerer:
+      <<: *airflow-common
+      command: triggerer
+      healthcheck:
+        test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+        interval: 10s
+        timeout: 10s
+        retries: 5
+      restart: always
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+
+
+    airflow-init:
+      <<: *airflow-common
+      command: version
+      environment:
+        <<: *airflow-common-env
+        _AIRFLOW_DB_UPGRADE: 'true'
+        _AIRFLOW_WWW_USER_CREATE: 'true'
+        _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+        _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      user: "${AIRFLOW_UID:-50000}:0"
+      # Creates a folder airflow in the same dir as docker-compose to store the dags, logs and plugins folders
+      volumes:
+        - ./airflow/:/sources
+
+
+    flower:
+      <<: *airflow-common
+      command: celery flower
+      ports:
+        - 5556:5555
+      healthcheck:
+        test: ["CMD", "curl", "--fail", "http://localhost:5556/"]
+        interval: 10s
+        timeout: 10s
+        retries: 5
+      restart: always
+
+
+volumes:
+    mlflow-data:
+    postgres-db-volume-mlflow:
+    postgres-db-volume-airflow:
+    postgres-db-volume-articles:
